@@ -1589,6 +1589,11 @@ void get_global_soft_statistics
 	(struct activity *, int, int, uint64_t, unsigned char []);
 void get_itv_value
 	(struct record_header *, struct record_header *, unsigned long long *);
+int get_timestamp_struct_from_timespec
+	(uint64_t, struct timespec *, struct tstamp_ext *);
+int get_timespec_from_timestamp_struct
+	(uint64_t, const char *, const struct timespec *, const struct tstamp_ext *,
+	 struct timespec *);
 void init_custom_color_palette
 	(void);
 int next_slice

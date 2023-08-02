@@ -80,6 +80,9 @@ struct file_header file_hdr;
 /* Current record header */
 struct record_header record_hdr[3];
 
+/* Information from PCP archive */
+pmHighResLogLabel log_label;
+
 /*
  * Activity sequence.
  * This array must always be entirely filled (even with trailing zeros).
@@ -90,6 +93,7 @@ struct tstamp_ext rectime;
 
 /* Contain the date specified by -s and -e options */
 struct tstamp_ext tm_start, tm_end;
+
 
 char *args[MAX_ARGV_NR];
 
@@ -497,6 +501,64 @@ int write_stats(int curr, int read_from_file, long *cnt, enum time_mode use_tm_s
 		*cnt = 0;
 		return 0;
 	}
+
+	/* Get interval value in 1/100th of a second */
+	get_itv_value(&record_hdr[curr], &record_hdr[!curr], &itv);
+
+	avg_count++;
+
+	/* Test stdout */
+	TEST_STDOUT(STDOUT_FILENO);
+
+	for (i = 0; i < NR_ACT; i++) {
+
+		if ((act_id != ALL_ACTIVITIES) && (act[i]->id != act_id))
+			continue;
+
+		if (IS_SELECTED(act[i]->options) && (act[i]->nr[curr] > 0)) {
+			/* Display current activity statistics */
+			(*act[i]->f_print)(act[i], !curr, curr, itv);
+			rc = 1;
+		}
+	}
+
+	return rc;
+}
+
+/*
+ ***************************************************************************
+ * Print system statistics using the PCP PMAPI.
+ * This is called when we read stats either from a PCP archive.
+ *
+ * IN:
+ * @curr		Index in array for current sample statistics.
+ * @reset		Set to TRUE if last_uptime variable should be
+ * 			reinitialized (used in next_slice() function).
+ * @act_id		Activity that can be displayed or ~0 for all.
+ *			Remember that when reading stats from a file, only
+ *			one activity can be displayed at a time.
+ *
+ * OUT:
+ * @cnt			Number of remaining lines to display.
+ *
+ * RETURNS:
+ * 1 if stats have been successfully displayed, and 0 otherwise.
+ ***************************************************************************
+ */
+int write_stats_pcp(int curr, long *cnt, int reset, unsigned int act_id)
+{
+	int i, rc = 0;
+	unsigned long long itv;
+
+	/* Get then set previous timestamp */
+	if (sa_get_record_timestamp_struct(flags, &record_hdr[!curr], &rectime))
+		return 0;
+	set_record_timestamp_string(flags, NULL, timestamp[!curr], TIMESTAMP_LEN, &rectime);
+
+	/* Get then set current timestamp */
+	if (sa_get_record_timestamp_struct(flags, &record_hdr[curr], &rectime))
+		return 0;
+	set_record_timestamp_string(flags, NULL, timestamp[curr], TIMESTAMP_LEN, &rectime);
 
 	/* Get interval value in 1/100th of a second */
 	get_itv_value(&record_hdr[curr], &record_hdr[!curr], &itv);
@@ -1189,7 +1251,6 @@ void print_report_hdr_pcpfile(char from_file[])
 {
 	pmValueSet		*values;
 	pmHighResResult		*result;
-	pmHighResLogLabel	log_label;
 	unsigned int		cpu_count = 0;
 	struct tm		tm_time;
 	char			*sysname, *release, *nodename, *machine;
@@ -1322,7 +1383,6 @@ int read_stats_from_result(pmHighResResult *result, struct file_header *header, 
 void handle_curr_act_pcpstats(pmHighResResult *result, int *curr, long *cnt,
 			int rows, int p, int *reset, char *file)
 {
-	int reset_cd;
 	unsigned int act_id = act[p]->id;
 	unsigned long lines = 0;
 	unsigned char rtype;
@@ -1345,7 +1405,6 @@ fprintf(stderr, "%s-%d\n", __FUNCTION__, 0);
 		inc = count_bits(act[p]->bitmap->b_array,
 				 BITMAP_SIZE(act[p]->bitmap->b_size));
 	}
-	reset_cd = 1;
 
 	do {
 		/*
@@ -1364,31 +1423,10 @@ fprintf(stderr, "%s-%d\n", __FUNCTION__, 0);
 			/* This is a mark record: Stop now */
 			break;
 
-		if (rtype == R_COMMENT) {
-#if 0	// nathans TODO
-			/* Display comment */
-			next = print_special_record(&record_hdr[*curr], flags,
-						    &tm_start, &tm_end, R_COMMENT,
-						    &rectime, file, 0, NULL,
-						    file_magic, &file_hdr, act, &sar_fmt,
-						    endian_mismatch, arch_64);
-			if (next && lines) {
-				/*
-				 * A line of comment was actually displayed: Count it in the
-				 * total number of displayed lines.
-				 * If no lines of stats had been previously displayed, ignore it
-				 * to make sure the header line will be displayed.
-				 */
-				lines++;
-			}
-#endif
-			continue;
-		}
-
+fprintf(stderr, "%s-%d cnt=%d\n", __FUNCTION__, 1, *cnt);
 		/* next is set to 1 when we were close enough to desired interval */
-		next = write_stats(*curr, USE_SA_FILE, cnt, tm_start.use, tm_end.use,
-				   *reset, act_id, reset_cd);
-		reset_cd = 0;
+		next = write_stats_pcp(*curr, cnt, *reset, act_id);
+fprintf(stderr, "%s-%d\n", __FUNCTION__, 2);
 		if (next && (*cnt > 0)) {
 			(*cnt)--;
 		}
@@ -1406,7 +1444,7 @@ fprintf(stderr, "%s-%d\n", __FUNCTION__, 0);
 		}
 		*reset = FALSE;
 	}
-	while (*cnt);
+	while (*cnt > 0);
 
 	/*
 	 * At this moment, if we had a R_RESTART record, we still haven't read
@@ -1431,7 +1469,11 @@ fprintf(stderr, "%s-%d\n", __FUNCTION__, 0);
  */
 void read_stats_from_pcpfile(char from_file[])
 {
+	int counter = 1; /* TODO: remove, diagnostic only */
+	struct timespec start = {0}, now, end = {PM_MAX_TIME_T, 0};
+	struct act_metrics *metrics;
 	pmHighResResult *result;
+	pmDesc desc;
 	pmID *tp, *pmids = NULL;
 	long cnt = 1;
 	int rows = get_win_height();
@@ -1454,102 +1496,95 @@ void read_stats_from_pcpfile(char from_file[])
 		id_seq[j++] = id;
 	}
 
+fprintf(stderr, "%s-%d\n", __FUNCTION__, counter++);
 	/* Print report header */
 	print_report_hdr_pcpfile(from_file);
-fprintf(stderr, "%s-%d\n", __FUNCTION__, 1);
 
+fprintf(stderr, "%s-%d\n", __FUNCTION__, counter++);
+	if (tm_start.use != NO_TIME &&
+		(sts = get_timespec_from_timestamp_struct(flags, log_label.timezone,
+				&log_label.start, &tm_start, &start)) != 0) {
+		fprintf(stderr, _("Cannot decode requested start time\n"));
+		return;
+	}
+	if ((sts = pmSetModeHighRes(PM_MODE_FORW, &start, NULL)) < 0) {
+		fprintf(stderr, _("Cannot set position within PCP file %s\n"),
+			from_file);
+		return;
+	}
+	if (tm_end.use != NO_TIME &&
+		(sts = get_timespec_from_timestamp_struct(flags, log_label.timezone,
+				&log_label.start, &tm_end, &end)) != 0) {
+		fprintf(stderr, _("Cannot decode requested end time\n"));
+		return;
+	}
+
+fprintf(stderr, "%s-%d\n", __FUNCTION__, counter++);
 	/* Perform required allocations */
 	allocate_structures(act);
-
-fprintf(stderr, "%s-%d\n", __FUNCTION__, 2);
-#if 0
-	/* TODO: restrict context to given timewindow now - tm_start, tm_end */
-	TimeWindow
-	pmSetMode
-#endif
-
-	/* TODO: consider raw vs interpolated modes - for now, interpolate only */
-	/* In practice, we'll more likely want to default to pmFetchArchive and */
-	/* match with traditional sysstat behaviour more closely.  nathans TODO */
 
 	/* Prep pmID array for fetching (value sampling); get only used metrics */
 	for (i = 0; i < NR_ACT; i++) {
 		if (!IS_SELECTED(act[i]->options))
 			continue;
 fprintf(stderr, "%s-act:%d\n", __FUNCTION__, act[i]->id);
-		if (!act[i]->metrics)
+		if ((metrics = act[i]->metrics) == NULL)
 			continue;
 fprintf(stderr, "%s-act:%d\n", __FUNCTION__, act[i]->id);
-		total = (numpmids + act[i]->metrics->count) * sizeof(pmID);
+
+		/* Check that the first metric in this group has been logged */
+		tp = &metrics->descs[0].pmid;
+		if (!DISPLAY_HDR_ONLY(flags) && pmLookupDesc(*tp, &desc) < 0) {
+			fprintf(stderr, _("Requested activities not available in file %s\n"),
+				from_file);
+			free(pmids);
+			return;
+		}
+
+		total = (numpmids + metrics->count) * sizeof(pmID);
 		if ((tp = realloc(pmids, total)) == NULL) {
 			/* ENOMEM error handling */
 			continue;
 		}
-		total = act[i]->metrics->count;
+		total = metrics->count;
 		/* append IDs for each metric associated with the activity */
 		for (j = 0, p = numpmids; j < total; j++, p++)
-			tp[p] = act[i]->metrics->descs[j].pmid;
+			tp[p] = metrics->descs[j].pmid;
 		numpmids = p;
 		pmids = tp;
 fprintf(stderr, "%s-numpmids:%d\n", __FUNCTION__, numpmids);
 	}
 
-#if 0	// nathans TODO: consider how best to do this for PCP archives
-	/* Check that at least one activity selected by the user is available in file */
-	for (i = 0; i < NR_ACT; i++) {
-		if (!IS_SELECTED(act[i]->options))
-			continue;
-		/* TODO: implement IS_RECORDED */
-		if (!IS_RECORDED(act[i]))
-			act[i]->options &= ~AO_SELECTED;	/* Unselect it */
-	}
-
-	/* TODO: can only do this for PCP after fetch attempt below */
-	if (!get_activity_nr(act, AO_SELECTED, COUNT_ACTIVITIES) && !DISPLAY_HDR_ONLY(flags)) {
-		fprintf(stderr, _("Requested activities not available in file %s\n"),
-			from_file);
-		return 1;
-	}
-#endif
-	rectime.use = USE_EPOCH_T;
-
 	/* Read system statistics from PCP archive */
 	do {
-fprintf(stderr, "%s-%d\n", __FUNCTION__, 3);
+fprintf(stderr, "%s-%d\n", __FUNCTION__, counter++);
 
 		if ((sts = pmFetchHighRes(numpmids, pmids, &result)) < 0) {
+fprintf(stderr, "%s-%d fail-fetched %d pmids (sts=%d)\n", __FUNCTION__, counter++, numpmids, sts);
 			if (sts != PM_ERR_EOF)
 				fprintf(stderr, "%s: %s\n", "sar", pmErrStr(sts));
 			break;
 		}
-		if (sts > 0) {
-			/* nathans TODO: handle pmcd change notification? */
-		}
+fprintf(stderr, "%s-%d fetched %d pmids (sts=%d)\n", __FUNCTION__, counter++, numpmids, sts);
 
-		rectime.epoch_time = result->timestamp.tv_sec;
+		now = result->timestamp;
+		rectime.use = USE_EPOCH_T;
+		rectime.epoch_time = now.tv_sec;
 
 #if 0
-		/* TODO mark record? - R_RESTART */
+		/* TODO: mark record - similar to R_RESTART */
 		if (result->numpmid == 0) {
-			print_pcp_mark_record(result);
+			print_pcp_mark_record(result, &sar_fmt);
 			pmFreeHighResResult(result);
 			continue;
 		}
 #endif
-
-#if 0
-		/* TODO comment entry? - R_COMMENT - sysstat.comment metric? */
-		if (result->numpmid == 1 && result->vset[0].pmid == PMI_ID(XXX)) {
-			print_pcp_comment_record(result);
-			pmFreeHighResResult(result);
-			continue;
-		}
-#endif
-
 
 #if 0	// nathans TODO
 		/* Save the first stats collected. Will be used to compute the average */
 		copy_structures(act, id_seq, result, 2, 0);
+#else
+fprintf(stderr, "%s-%d - missing copy_structures\n", __FUNCTION__, counter++);
 #endif
 
 		reset = TRUE;	/* Set flag to reset last_uptime variable */
@@ -1559,6 +1594,7 @@ fprintf(stderr, "%s-%d\n", __FUNCTION__, 3);
 		 * Activities that should be displayed are saved in id_seq[] array.
 		 */
 		for (i = 0; i < NR_ACT; i++) {
+fprintf(stderr, "%s-%d\n", __FUNCTION__, counter++);
 
 			if (!id_seq[i])
 				continue;
@@ -1568,6 +1604,7 @@ fprintf(stderr, "%s-%d\n", __FUNCTION__, 3);
 				continue;
 
 			if (!HAS_MULTIPLE_OUTPUTS(act[p]->options)) {
+fprintf(stderr, "%s-%d-\n", __FUNCTION__, counter++);
 				handle_curr_act_pcpstats(result, &curr,
 							&cnt, rows, p,
 							&reset, from_file);
@@ -1576,6 +1613,7 @@ fprintf(stderr, "%s-%d\n", __FUNCTION__, 3);
 				unsigned int optf, msk;
 
 				optf = act[p]->opt_flags;
+fprintf(stderr, "%s-%d!\n", __FUNCTION__, counter++);
 
 				for (msk = 1; msk < 0x100; msk <<= 1) {
 					if (!((act[p]->opt_flags & 0xff) & msk))
@@ -1592,17 +1630,12 @@ fprintf(stderr, "%s-%d\n", __FUNCTION__, 3);
 
 		pmFreeHighResResult(result);
 
-fprintf(stderr, "rectime:use=%d\n", rectime.use);
-fprintf(stderr, "rectime:epoch_time=%llu\n", rectime.epoch_time);
-fprintf(stderr, "tmstart:use=%d\n", tm_start.use);
-fprintf(stderr, "tmstart:epoch_time=%llu\n", tm_start.epoch_time);
-fprintf(stderr, "tmend:use=%d\n", tm_end.use);
-fprintf(stderr, "tmend:epoch_time=%llu\n", tm_end.epoch_time);
+fprintf(stderr, "%s-comparing %lld to %lld\n", __FUNCTION__, now.tv_sec, end.tv_sec);
 
-	} while ((datecmp(&rectime, &tm_start, FALSE) >= 0) &&
-	         (datecmp(&rectime, &tm_end, FALSE) < 0));
+	} while (now.tv_sec < end.tv_sec);
 
 fprintf(stderr, "%s-end\n", __FUNCTION__);
+	free(pmids);
 }
 
 /*
