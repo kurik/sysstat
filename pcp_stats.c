@@ -37,7 +37,7 @@
 #include <pcp/import.h>
 #endif
 
-extern struct record_header *record_hdr;
+extern struct record_header record_hdr[];
 extern struct activity *act[];
 extern uint64_t flags;
 extern char bat_status[][16];
@@ -1071,13 +1071,13 @@ __print_funct_t pcp_print_queue_stats(struct activity *a, int curr)
 	snprintf(buf, sizeof(buf), "%lu", (unsigned long) sqc->procs_blocked);
 	pmiPutValue("kernel.all.blocked", NULL, buf);
 
-	snprintf(buf, sizeof(buf), "%f", (double) sqc->load_avg_1 / 100);
+	snprintf(buf, sizeof(buf), "%f", (double) sqc->load_avg_1 / 100.0);
 	pmiPutValue("kernel.all.load", "1 minute", buf);
 
-	snprintf(buf, sizeof(buf), "%f", (double) sqc->load_avg_5 / 100);
+	snprintf(buf, sizeof(buf), "%f", (double) sqc->load_avg_5 / 100.0);
 	pmiPutValue("kernel.all.load", "5 minute", buf);
 
-	snprintf(buf, sizeof(buf), "%f", (double) sqc->load_avg_15 / 100);
+	snprintf(buf, sizeof(buf), "%f", (double) sqc->load_avg_15 / 100.0);
 	pmiPutValue("kernel.all.load", "15 minute", buf);
 }
 
@@ -1122,22 +1122,22 @@ void pcp_read_kqueue_stats(pmValueSet *values, struct activity *a, int curr)
 			switch (values->vlist[i].inst) {
 
 			case 1: /* 1 minute average */
-				sqc->load_avg_1 = 100 * (unsigned int)
+				sqc->load_avg_1 = (unsigned int)(100.0 *
 					pcp_read_float(values, i,
 						kqueue_metric_descs,
-						KQUEUE_LOADAVG);
+						KQUEUE_LOADAVG));
 				break;
 			case 5: /* 5 minute average */
-				sqc->load_avg_5 = 100 * (unsigned int)
+				sqc->load_avg_5 = (unsigned int)(100.0 *
 					pcp_read_float(values, i,
 						kqueue_metric_descs,
-						KQUEUE_LOADAVG);
+						KQUEUE_LOADAVG));
 				break;
 			case 15: /* 15 minute average */
-				sqc->load_avg_15 = 100 * (unsigned int)
+				sqc->load_avg_15 = (unsigned int)(100.0 *
 					pcp_read_float(values, i,
 						kqueue_metric_descs,
-						KQUEUE_LOADAVG);
+						KQUEUE_LOADAVG));
 				break;
 			}
 		}
@@ -4300,17 +4300,14 @@ void pcp_read_file_header_stats(pmValueSet *values, struct file_header *file_hdr
  */
 void pcp_read_record_header_stats(pmValueSet *values, int curr)
 {
-	struct record_header *header = &record_hdr[curr];
-
 	/*
 	 * Metrics that augment the information from the PCP archive label.
 	 * The label provides sa_ust_time (start time) and sa_tzname ($TZ).
 	 */
-
 	switch (values->pmid) {
 
 		case PMID_RECORD_HEADER_KERNEL_UPTIME:
-			header->uptime_cs = (unsigned long long)
+			record_hdr[curr].uptime_cs = (unsigned long long)
 					(100.0 * pcp_read_double(values, 0,
 						record_header_metrics.descs,
 						RECORD_HEADER_KERNEL_UPTIME));
@@ -4338,6 +4335,9 @@ void pcp_read_record_header_stats(pmValueSet *values, int curr)
  */
 void pcp_read_stats(pmValueSet *values, struct file_header *header, int curr)
 {
+	if (values->numval <= 0)
+		return;
+
 	switch (values->pmid) {
 
 		case PMID_FILE_HEADER_CPU_COUNT:
@@ -4468,6 +4468,7 @@ void pcp_read_stats(pmValueSet *values, struct file_header *header, int curr)
 		case PMID_KQUEUE_BLOCKED:
 		case PMID_KQUEUE_LOADAVG:
 			pcp_read_kqueue_stats(values, act[A_QUEUE], curr);
+			break;
 
 		case PMID_DISK_PERDEV_READ:
 		case PMID_DISK_PERDEV_WRITE:
