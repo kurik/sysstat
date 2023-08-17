@@ -42,6 +42,8 @@
 #ifdef HAVE_PCP
 #include <pcp/pmapi.h>
 #include <pcp/import.h>
+#include "pcp_def_metrics.h"
+#include "pcp_stats.h"
 #endif
 
 #ifdef USE_SCCSID
@@ -74,6 +76,14 @@ unsigned int user_hz = 0;	/* HZ value set with option -O */
 
 /* File header */
 struct file_header file_hdr;
+
+#ifdef HAVE_PCP
+/* Information from PCP archive */
+pmHighResLogLabel log_label;
+struct tstamp_ext rectime;
+char timestamp[2][TIMESTAMP_LEN];
+unsigned long avg_count = 0;
+#endif /* HAVE_PCP */
 
 /*
  * Activity sequence.
@@ -1464,16 +1474,16 @@ close_svg:
 
 /*
  ***************************************************************************
- * Check system activity datafile contents before displaying stats.
+ * Check system activity raw datafile contents before displaying stats.
  * Display file header if option -H has been entered, else call function
  * corresponding to selected output format.
  *
  * IN:
- * @dfile	System activity data file name.
- * @pcparchive	PCP archive file name.
+ * @dfile	System activity raw data file name.
+ * @pcparchive	Output PCP archive file name.
  ***************************************************************************
  */
-void read_stats_from_file(char dfile[], char pcparchive[])
+void read_stats_from_rawfile(char dfile[], char pcparchive[])
 {
 	struct file_magic file_magic;
 	struct file_activity *file_actlst = NULL;
@@ -1515,6 +1525,451 @@ void read_stats_from_file(char dfile[], char pcparchive[])
 
 	free(file_actlst);
 	free_structures(act);
+}
+
+#ifdef HAVE_PCP
+
+/*
+ ***************************************************************************
+ * Print system statistics using the PCP PMAPI.
+ * This is called when we read stats either from a PCP archive.
+ *
+ * IN:
+ * @curr		Index in array for current sample statistics.
+ * @reset		Set to TRUE if last_uptime variable should be
+ * 			reinitialized (used in next_slice() function).
+ * @act_id		Activity that can be displayed or ~0 for all.
+ *			Remember that when reading stats from a file, only
+ *			one activity can be displayed at a time.
+ *
+ * OUT:
+ * @cnt			Number of remaining lines to display.
+ *
+ * RETURNS:
+ * 1 if stats have been successfully displayed, and 0 otherwise.
+ ***************************************************************************
+ */
+int write_stats_pcp(int curr, long *cnt, int reset, unsigned int act_id)
+{
+	int i, rc = 0;
+	unsigned long long itv;
+
+	/* Get then set previous timestamp */
+	if (sa_get_record_timestamp_struct(flags, &record_hdr[!curr], &rectime))
+		return 0;
+	set_record_timestamp_string(flags, NULL, timestamp[!curr], TIMESTAMP_LEN, &rectime);
+
+	/* Get then set current timestamp */
+	if (sa_get_record_timestamp_struct(flags, &record_hdr[curr], &rectime))
+		return 0;
+	set_record_timestamp_string(flags, NULL, timestamp[curr], TIMESTAMP_LEN, &rectime);
+
+	/* Get interval value in 1/100th of a second */
+	get_itv_value(&record_hdr[curr], &record_hdr[!curr], &itv);
+
+	avg_count++;
+
+	/* Test stdout */
+	TEST_STDOUT(STDOUT_FILENO);
+
+	for (i = 0; i < NR_ACT; i++) {
+
+		if ((act_id != ALL_ACTIVITIES) && (act[i]->id != act_id))
+			continue;
+
+		if (IS_SELECTED(act[i]->options) && (act[i]->nr[curr] > 0)) {
+			/* Display current activity statistics */
+			(*act[i]->f_print)(act[i], !curr, curr, itv);
+			rc = 1;
+		}
+	/* Call function corresponding to selected output format */
+        if (*fmt[f_position]->f_display) {
+                (*fmt[f_position]->f_display)(ifd, dfile, file_actlst, &file_magic,
+                                              &rectime, pcparchive);
+        }
+
+	}
+
+	return rc;
+}
+
+/*
+ ***************************************************************************
+ * Scan fetch result and enter into individual activity buffers.
+ * Ideally perform this in a single pass of the result structure.
+ *
+ * IN:
+ * @result	Fetch result, grouping of metrics spanning all activities.
+ * @header	System activity file standard header.
+ * @curr	Index in array for current sample statistics.
+ ***************************************************************************
+ */
+int read_stats_from_result(pmHighResResult *result, struct file_header *header, int curr)
+{
+	int i;
+
+	if (result->numpmid == 0)
+		return R_RESTART;	/* mark record */
+
+	for (i = 0; i < result->numpmid; i++) {
+		pcp_read_stats(result->vset[i], header, curr);
+	}
+
+	record_hdr[curr].ust_time = result->timestamp.tv_sec;
+	record_hdr[curr].uptime_cs = result->timestamp.tv_sec / 100;
+
+	return 0;
+}
+
+/*
+ ***************************************************************************
+ * Read current activity's statistics from PCP archive and display them.
+ *
+ * IN:
+ * @result      Metric values and timestamp.
+ * @curr        Index in array for current sample statistics.
+ * @rows        Number of rows of screen.
+ * @act_id      Activity to display.
+ * @file        Name of file being read.
+ *
+ * OUT:
+ * @curr        Index in array for next sample statistics.
+ * @cnt         Number of remaining lines of stats to write.
+ * @reset       Set to TRUE if last_uptime variable should be reinitialized
+ *              (used in next_slice() function).
+ ***************************************************************************
+ */     
+void handle_curr_act_pcpstats(pmHighResResult *result, int *curr, long *cnt,
+                        int rows, int p, int *reset, char *file)
+{
+	unsigned int act_id = act[p]->id;
+	unsigned long lines = 0;
+	unsigned char rtype;
+	int davg = 0, next, inc = 0;
+
+	*cnt  = count;
+
+	do {
+		/*
+		 * Display <count> lines of stats.
+		 */
+		rtype = read_stats_from_result(result, &file_hdr, *curr);
+
+		if (rtype == R_RESTART)
+			/* This is a mark record: Stop now */
+			break;
+
+		next = write_stats_pcp(*curr, cnt, *reset, act_id);
+		if (next && (*cnt > 0)) {
+			(*cnt)--;
+		}
+
+		if (next) {
+			davg++;
+			*curr ^= 1;
+
+			if (inc) {
+				lines += inc;
+			}
+			else {
+				lines += act[p]->nr[*curr];
+			}
+		}
+		*reset = FALSE;
+	}
+	while (*cnt > 0);
+
+	/*
+	 * At this moment, if we had a R_RESTART record, we still haven't read
+	 * the number of CPU following it (nor the possible extra structures).
+	 * But in this case, we always have @cnt != 0.
+	 */
+
+	/* JKU TODO
+	if (davg) {
+		write_stats_avg(!*curr, USE_SA_FILE, act_id);
+	}
+	*/
+
+	*reset = TRUE;
+}
+
+/* JKU TODO - rename to something usefull as the function does not print anything
+ ***************************************************************************
+ * Print report header.
+ *
+ * IN:
+ * @dfile	Input file name.
+ ***************************************************************************
+ */
+void print_report_hdr_pcpfile(char dfile[])
+{
+	pmValueSet		*values;
+	pmHighResResult		*result;
+	unsigned int		cpu_count = 0;
+	struct tm		tm_time;
+	char			*sysname, *release, *nodename, *machine;
+	pmID			pmids[FILE_HEADER_METRIC_COUNT];
+	int			i, sts;
+
+	if ((sts = pmGetHighResArchiveLabel(&log_label)) < 0) {
+		fprintf(stderr, 
+			_("Cannot read archive label from file %s: %s\n"),
+			dfile, pmErrStr(sts));
+		return;
+	}
+	pmLocaltime(&log_label.start.tv_sec, &tm_time);
+
+	for (i = 0; i < FILE_HEADER_METRIC_COUNT; i++)
+		pmids[i] = file_header_metrics.descs[i].pmid;
+
+	if ((sts = pmFetchHighRes(FILE_HEADER_METRIC_COUNT, pmids, &result)) < 0) {
+		fprintf(stderr, 
+			_("Cannot read header metrics from file %s: %s\n"),
+			dfile, pmErrStr(sts));
+		return;
+	}
+
+	sysname = release = nodename = machine = NULL;
+
+	for (i = 0; i < result->numpmid; i++) {
+
+		values = result->vset[i];
+		if (values->numval != 1)
+			continue;
+
+		switch (values->pmid) {
+
+			case PMID_FILE_HEADER_CPU_COUNT:
+				cpu_count = pcp_read_u32(values, 0,
+							file_header_metrics.descs,
+							FILE_HEADER_CPU_COUNT);
+				break;
+
+			case PMID_FILE_HEADER_UNAME_SYSNAME:
+				sysname = pcp_read_str(values, 0,
+							file_header_metrics.descs,
+							FILE_HEADER_UNAME_SYSNAME);
+				break;
+
+			case PMID_FILE_HEADER_UNAME_RELEASE:
+				release = pcp_read_str(values, 0,
+							file_header_metrics.descs,
+							FILE_HEADER_UNAME_RELEASE);
+				break;
+
+			case PMID_FILE_HEADER_UNAME_NODENAME:
+				nodename = pcp_read_str(values, 0,
+							file_header_metrics.descs,
+							FILE_HEADER_UNAME_NODENAME);
+				break;
+
+			case PMID_FILE_HEADER_UNAME_MACHINE:
+				machine = pcp_read_str(values, 0,
+							file_header_metrics.descs,
+							FILE_HEADER_UNAME_MACHINE);
+				break;
+		}
+	}
+
+	if (cpu_count == 0) {
+		fprintf(stderr, 
+			_("Missing processor count metric in archive %s\n"),
+			dfile);
+	}
+
+	pmFreeHighResResult(result);
+	free(sysname);
+	free(release);
+	free(nodename);
+	free(machine);
+}
+
+
+/*
+ ***************************************************************************
+ * Read statistics from a PCP system activity data file.
+ *
+ * IN:
+ * @dfile        Input file name.
+ * @pcparchive   Output PCP archive file name.
+ ***************************************************************************
+ */
+void read_stats_from_pcpfile(char dfile[], char pcparchive[])
+{
+	struct timespec start = {0}, now, end = {PM_MAX_TIME_T, 0};
+	struct timespec delta = {60, 0};
+	struct act_metrics *metrics;
+	pmHighResResult *result;
+	pmDesc desc;
+	pmID *tp, *pmids = NULL;
+	long cnt = 1;
+	int rows = get_win_height();
+	unsigned int id;
+	size_t total;
+	int mode, numpmids;
+	int i, j, p, sts, curr = 1, reset = FALSE;
+
+	j = 0;
+	for (i = 0; i < NR_ACT; i++) {
+		id = act[i]->id;
+		if ((p = get_activity_position(act, id, RESUME_IF_NOT_FOUND)) < 0) {
+			continue;	/* Unknown activity */
+		}
+
+                if (DISPLAY_HDR_ONLY(flags)) {
+			id_seq[j++] = 0;
+			continue;
+		}
+
+		id_seq[j++] = id;
+	}
+
+	/* Print report header */
+	print_report_hdr_pcpfile(dfile);
+
+	if (tm_start.use != NO_TIME &&
+		(sts = get_timespec_from_timestamp_struct(flags, log_label.timezone,
+				&log_label.start, &tm_start, &start)) != 0) {
+		fprintf(stderr, _("Cannot decode requested start time\n"));
+		return;
+	}
+	mode = PM_MODE_INTERP;
+	if ((sts = pmSetModeHighRes(mode, &log_label.start, &delta)) < 0) {
+		fprintf(stderr, _("Cannot set sample mode of PCP file %s\n"),
+			dfile);
+		return;
+	}
+	if (tm_end.use != NO_TIME &&
+		(sts = get_timespec_from_timestamp_struct(flags, log_label.timezone,
+				&log_label.start, &tm_end, &end)) != 0) {
+		fprintf(stderr, _("Cannot decode requested end time\n"));
+		return;
+	}
+
+	/* Perform required allocations */
+	allocate_structures(act);
+
+	/* fetch 'record header' metrics every time */
+	numpmids = RECORD_HEADER_METRIC_COUNT;
+	if ((tp = calloc(numpmids, sizeof(pmID))) == NULL) {
+		/* ENOMEM error handling */
+		return;
+	}
+	/* append IDs for each record header metric */
+	for (j = 0; j < numpmids; j++)
+		tp[j] = record_header_metric_descs[j].pmid;
+	pmids = tp;
+
+	/* Prep pmID array for fetching (value sampling); get only used metrics */
+	for (i = 0; i < NR_ACT; i++) {
+		if (!IS_SELECTED(act[i]->options))
+			continue;
+		if ((metrics = act[i]->metrics) == NULL)
+			continue;
+
+		/* Check that the first metric in this group has been logged */
+		tp = &metrics->descs[0].pmid;
+		if (!DISPLAY_HDR_ONLY(flags) && pmLookupDesc(*tp, &desc) < 0) {
+			fprintf(stderr, _("Requested activities not available in file %s\n"),
+				dfile);
+			free(pmids);
+			return;
+		}
+
+		total = (numpmids + metrics->count) * sizeof(pmID);
+		if ((tp = realloc(pmids, total)) == NULL) {
+			/* ENOMEM error handling */
+			continue;
+		}
+		total = metrics->count;
+		/* append IDs for each metric associated with the activity */
+		for (j = 0, p = numpmids; j < total; j++, p++)
+			tp[p] = metrics->descs[j].pmid;
+		numpmids = p;
+		pmids = tp;
+	}
+
+	/* Read system statistics from PCP archive */
+	do {
+		if ((sts = pmFetchHighRes(numpmids, pmids, &result)) < 0) {
+			if (sts != PM_ERR_EOL)
+				fprintf(stderr, "%s: %s\n", "sar", pmErrStr(sts));
+			break;
+		}
+
+		now = result->timestamp;
+		rectime.use = USE_EPOCH_T;
+		rectime.epoch_time = now.tv_sec;
+
+		reset = TRUE;	/* Set flag to reset last_uptime variable */
+
+		/*
+		 * Read and write stats located between two possible mark records.
+		 * Activities that should be displayed are saved in id_seq[] array.
+		 */
+		for (i = 0; i < NR_ACT; i++) {
+
+			if (!id_seq[i])
+				continue;
+
+			p = get_activity_position(act, id_seq[i], EXIT_IF_NOT_FOUND);
+			if (!IS_SELECTED(act[p]->options))
+				continue;
+
+			if (!HAS_MULTIPLE_OUTPUTS(act[p]->options)) {
+				handle_curr_act_pcpstats(result, &curr,
+							&cnt, rows, p,
+							&reset, dfile);
+			}
+			else {
+				unsigned int optf, msk;
+
+				optf = act[p]->opt_flags;
+
+				for (msk = 1; msk < 0x100; msk <<= 1) {
+					if (!((act[p]->opt_flags & 0xff) & msk))
+						continue;
+					act[p]->opt_flags &= (0xffffff00 + msk);
+
+					handle_curr_act_pcpstats(result, &curr,
+							&cnt, rows, p,
+							&reset, dfile);
+					act[p]->opt_flags = optf;
+				}
+			}
+		}
+
+		pmFreeHighResResult(result);
+	} while (now.tv_sec < end.tv_sec);
+
+	free(pmids);
+}
+#endif /* HAVE_PCP */
+
+
+/*
+ ***************************************************************************
+ * Read statistics from either any system activity data file.
+ *
+ * IN:
+ * @dfile        Input file name.
+ * @pcparchive   Output PCP archive file name.
+ ***************************************************************************
+ */
+void read_stats_from_file(char dfile[], char pcparchive[])
+{
+#ifdef HAVE_PCP
+	int ctx;
+
+	if ((ctx = pmNewContext(PM_CONTEXT_ARCHIVE, dfile)) >= 0) {
+		read_stats_from_pcpfile(dfile, pcparchive);
+		pmDestroyContext(ctx);
+		return;
+	}
+#endif /* HAVE_PCP */
+
+	read_stats_from_rawfile(dfile, pcparchive);
 }
 
 /*
