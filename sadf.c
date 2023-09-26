@@ -1582,12 +1582,11 @@ int write_stats_pcp(int curr, long *cnt, int reset, unsigned int act_id)
 			(*act[i]->f_print)(act[i], !curr, curr, itv);
 			rc = 1;
 		}
-	/* Call function corresponding to selected output format */
-        if (*fmt[f_position]->f_display) {
-                (*fmt[f_position]->f_display)(ifd, dfile, file_actlst, &file_magic,
+		/* Call function corresponding to selected output format */
+        	if (*fmt[f_position]->f_display) {
+                	(*fmt[f_position]->f_display)(ifd, dfile, file_actlst, &file_magic,
                                               &rectime, pcparchive);
-        }
-
+        	}
 	}
 
 	return rc;
