@@ -195,6 +195,29 @@ __printf_funct_t print_pcp_header
 	(void *, int, char *, char *, struct file_magic *, struct file_header *,
 	 struct activity * [], unsigned int [], struct file_activity *);
 
+#ifdef HAVE_PCP
+/*
+ * Prototypes used to display the report header for PCP archive input
+ */
+__printf_funct_t print_hdr_header_pcp
+	(void *, int, char *, char *, struct file_magic *, struct file_header *,
+	 struct activity * [], unsigned int [], struct file_activity *);
+/* JKU TODO
+__printf_funct_t print_xml_header_pcp
+	(void *, int, char *, char *, struct file_magic *, struct file_header *,
+	 struct activity * [], unsigned int [], struct file_activity *);
+__printf_funct_t print_json_header_pcp
+	(void *, int, char *, char *, struct file_magic *, struct file_header *,
+	 struct activity * [], unsigned int [], struct file_activity *);
+__printf_funct_t print_svg_header_pcp
+	(void *, int, char *, char *, struct file_magic *, struct file_header *,
+	 struct activity * [], unsigned int [], struct file_activity *);
+__printf_funct_t print_pcp_header_pcp
+	(void *, int, char *, char *, struct file_magic *, struct file_header *,
+	 struct activity * [], unsigned int [], struct file_activity *);
+*/
+#endif
+
 /*
  * Main display functions
  */

@@ -42,6 +42,8 @@
 #ifdef HAVE_PCP
 #include <pcp/pmapi.h>
 #include <pcp/import.h>
+#include "pcp_def_metrics.h"
+#include "pcp_stats.h"
 #endif
 
 #ifdef USE_SCCSID
@@ -102,6 +104,13 @@ char bat_status[][16] = {
 	"NotCharging",
 	"Full"
 };
+
+#ifdef HAVE_PCP
+
+/* Information from PCP archive */
+pmHighResLogLabel log_label;
+
+#endif /* HAVE_PCP */
 
 /*
  ***************************************************************************
@@ -1462,6 +1471,165 @@ close_svg:
 	}
 }
 
+#ifdef HAVE_PCP
+
+/*
+ ***************************************************************************
+ * Print report header.
+ *                      
+ * IN:                          
+ * @from_file   Input file name.
+ ***************************************************************************
+ */             
+void print_report_hdr_pcpfile(int ctxid, char from_file[])
+{                               
+	int 			sts;
+	unsigned int 		i, cpu_count = 0;
+	struct tm 		tm_time;
+	char                    *sysname, *release, *nodename, *machine;
+	pmHighResResult         *result;
+	pmValueSet              *values;
+	char                    host[MAXHOSTNAMELEN] = {0};
+
+        if ((sts = pmGetHighResArchiveLabel(&log_label)) < 0) {
+                fprintf(stderr, 
+                        _("Cannot read archive label from file %s: %s\n"),
+                        from_file, pmErrStr(sts));
+                return;
+        }
+        pmLocaltime(&log_label.start.tv_sec, &tm_time);
+
+        sysname = release = nodename = machine = NULL;
+
+	for (i = 0; i < FILE_HEADER_METRIC_COUNT; i++) {
+		if ((sts = pmSetModeHighRes(PM_MODE_FORW, &log_label.start, NULL)) < 0) {
+                        fprintf(stderr, _("Cannot set sample mode of PCP archive %s\n"),
+                                from_file);
+                        continue;
+                }
+		if ((sts = pmFetchHighRes(1, &file_header_metrics.descs[i].pmid, &result)) < 0) {
+                        fprintf(stderr,
+                                _("Cannot read header metric from archive %s: %s\n"),
+                                from_file, pmErrStr(sts));
+                        continue;
+                }
+		if (result->numpmid != 1) {
+                        pmFreeHighResResult(result);
+                        continue;
+                }
+		values = result->vset[0];
+                if (values->numval != 1) {
+                        pmFreeHighResResult(result);
+                        continue;
+                }
+		values = result->vset[0];
+                if (values->numval != 1) {
+                        pmFreeHighResResult(result);
+                        continue;
+                }
+
+		switch (values->pmid) {
+
+                        case PMID_FILE_HEADER_CPU_COUNT:
+                                cpu_count = pcp_read_u32(values, 0,
+                                                        file_header_metrics.descs,
+                                                        FILE_HEADER_CPU_COUNT);
+                                break;
+
+                        case PMID_FILE_HEADER_UNAME_SYSNAME:
+                                sysname = pcp_read_str(values, 0,
+                                                        file_header_metrics.descs,
+                                                        FILE_HEADER_UNAME_SYSNAME);
+                                break;
+
+                        case PMID_FILE_HEADER_UNAME_RELEASE:
+                                release = pcp_read_str(values, 0,
+                                                        file_header_metrics.descs,
+                                                        FILE_HEADER_UNAME_RELEASE);
+                                break;
+
+			case PMID_FILE_HEADER_UNAME_NODENAME:
+                                nodename = pcp_read_str(values, 0,
+                                                        file_header_metrics.descs,
+                                                        FILE_HEADER_UNAME_NODENAME);
+                                break;
+
+                        case PMID_FILE_HEADER_UNAME_MACHINE:
+                                machine = pcp_read_str(values, 0,
+                                                        file_header_metrics.descs,
+                                                        FILE_HEADER_UNAME_MACHINE);
+                                break;
+                }
+
+                pmFreeHighResResult(result);
+	}
+	if (sysname == NULL || release == NULL || machine == NULL) {
+                fprintf(stderr,
+                        _("Missing host information metrics in archive %s\n"),
+                        from_file);
+        } else {
+        	if (cpu_count > 0) {
+                	if (nodename == NULL)
+                        	pmGetContextHostName_r(ctxid, host, sizeof(host));
+
+                	print_gal_header(&tm_time, sysname, release,
+                                 	nodename ? nodename : host,
+                                 	machine, cpu_count, PLAIN_OUTPUT);
+        	} else {
+                	fprintf(stderr,
+                        	_("Missing processor count metric in archive %s\n"),
+                        	from_file);
+		}
+	}
+
+        if (sysname != NULL)  free(sysname);
+        if (release != NULL)  free(release);
+        if (nodename != NULL) free(nodename);
+        if (machine != NULL)  free(machine);
+}
+
+/*
+ ***************************************************************************
+ * Displaying stats of PCP archive file.
+ * Display file header if option -H has been entered, else call function
+ * corresponding to selected output format.
+ *
+ * IN:
+ * @dfile	Input PCP archive file name.
+ * @pcparchive	Output PCP archive file name.
+ ***************************************************************************
+ */
+void read_stats_from_pcpfile(int ctxid, char dfile[], char pcparchive[])
+{
+	unsigned int i, id;
+
+	for (i = 0; i < NR_ACT; i++) {
+		id = act[i]->id;
+		if (get_activity_position(act, id, RESUME_IF_NOT_FOUND) < 0) {
+			continue;
+		}
+		if (DISPLAY_HDR_ONLY(flags)) {
+			id_seq[i] = 0;
+		} else {
+			id_seq[i] = id;
+		}
+	}
+
+	if (DISPLAY_HDR_ONLY(flags)) {
+		if (*fmt[f_position]->f_header) {
+			if (format == F_PCP_OUTPUT) {
+				dfile = pcparchive;
+			}
+			/* Display only data file header then exit */
+			(*fmt[f_position]->f_header)(&ctxid, F_BEGIN + F_END, dfile, my_tzname,
+						     NULL, NULL, act, id_seq,
+						     NULL);
+		}
+		exit(0);
+	}
+}
+#endif /* HAVE_PCP */
+
 /*
  ***************************************************************************
  * Check system activity datafile contents before displaying stats.
@@ -1479,6 +1647,15 @@ void read_stats_from_file(char dfile[], char pcparchive[])
 	struct file_activity *file_actlst = NULL;
 	struct tstamp_ext rectime;
 	int ifd, tab = 0;
+#ifdef HAVE_PCP
+	int ctx;
+
+	if ((ctx = pmNewContext(PM_CONTEXT_ARCHIVE, dfile)) >= 0) {
+		read_stats_from_pcpfile(ctx, dfile, pcparchive);
+		pmDestroyContext(ctx);
+		return;
+	}
+#endif /* HAVE_PCP */
 
 	/* Prepare file for reading and read its headers */
 	check_file_actlst(&ifd, dfile, act, flags, &file_magic, &file_hdr,

@@ -1321,6 +1321,184 @@ __printf_funct_t print_hdr_header(void *parm, int action, char *dfile, char *my_
 	}
 }
 
+#ifdef HAVE_PCP
+/*
+ ***************************************************************************
+ * Display data file header for PCP archive input.
+ *
+ * IN:
+ * @parm	Specific parameter (unused here).
+ * @action	Action expected from current function.
+ * @dfile	Name of system activity data file (unused here).
+ * @my_tz	Current timezone (unused here).
+ * @file_magic	System activity file magic header.
+ * @file_hdr	System activity file standard header.
+ * @act		Array of activities.
+ * @id_seq	Activity sequence.
+ * @file_actlst	List of (known or unknown) activities in file.
+ ***************************************************************************
+ */
+pmHighResLogLabel log_label;
+__printf_funct_t print_hdr_header_pcp(void *parm, int action, char *dfile, char *my_tz,
+				  struct file_magic *file_magic,
+				  struct file_header *file_hdr,
+				  struct activity *act[], unsigned int id_seq[],
+				  struct file_activity *file_actlst)
+{
+	pmValueSet              *values;
+        pmHighResResult         *result;
+        unsigned int            cpu_count = 0;
+        struct tm               tm_time;
+        char                    *sysname, *release, *nodename, *machine, * version;
+        char                    host[MAXHOSTNAMELEN] = {0};
+        int                     i, sts;
+
+	/* Actions F_MAIN and F_END ignored */
+	if (action & F_BEGIN) {
+		if ((sts = pmGetHighResArchiveLabel(&log_label)) < 0) {
+                	fprintf(stderr, 
+                        	_("Cannot read archive label from file %s: %s\n"),
+                        	dfile, pmErrStr(sts));
+                	return;
+        	}
+		pmLocaltime(&log_label.start.tv_sec, &tm_time);
+
+		sysname = release = nodename = machine = NULL;
+
+        	for (i = 0; i < FILE_HEADER_METRIC_COUNT; i++) {
+                	if ((sts = pmSetModeHighRes(PM_MODE_FORW, &log_label.start, NULL)) < 0) {
+                        	fprintf(stderr, _("Cannot set sample mode of PCP archive %s\n"),
+                                	dfile);
+                        	continue;
+                	}
+                	if ((sts = pmFetchHighRes(1, &file_header_metrics.descs[i].pmid, &result)) < 0) {
+                        	fprintf(stderr,
+                               		_("Cannot read header metric from archive %s: %s\n"),
+                               		from_file, pmErrStr(sts));
+                        	continue;
+                	}
+
+               		if (result->numpmid != 1) {
+                       		pmFreeHighResResult(result);
+                       		continue;
+               		}
+			values = result->vset[0];
+               		if (values->numval != 1) {
+                       		pmFreeHighResResult(result);
+                       		continue;
+               		}
+			switch (values->pmid) {
+
+                        	case PMID_FILE_HEADER_CPU_COUNT:
+                                	cpu_count = pcp_read_u32(values, 0,
+                                                        	file_header_metrics.descs,
+                                                        	FILE_HEADER_CPU_COUNT);
+                                	break;
+
+                        	case PMID_FILE_HEADER_UNAME_SYSNAME:
+                                	sysname = pcp_read_str(values, 0,
+                                                        	file_header_metrics.descs,
+                                                        	FILE_HEADER_UNAME_SYSNAME);
+                                	break;
+
+                        	case PMID_FILE_HEADER_UNAME_RELEASE:
+                                	release = pcp_read_str(values, 0,
+                                                        	file_header_metrics.descs,
+                                                        	FILE_HEADER_UNAME_RELEASE);
+                                	break;
+
+                        	case PMID_FILE_HEADER_UNAME_NODENAME:
+                                	nodename = pcp_read_str(values, 0,
+                                                        	file_header_metrics.descs,
+                                                        	FILE_HEADER_UNAME_NODENAME);
+                                	break;
+				case PMID_FILE_HEADER_UNAME_MACHINE:
+                                	machine = pcp_read_str(values, 0,
+                                                        	file_header_metrics.descs,
+                                                        	FILE_HEADER_UNAME_MACHINE);
+                                	break;
+				case PMI_ID(2, 0, 7):
+                                	version = pcp_read_str(values, 0,
+                                                        	file_header_metrics.descs,
+                                                        	PM_TYPE_STRING);
+                                	break;
+                	}
+
+                	pmFreeHighResResult(result);
+		}
+
+		printf(_("PCP data file: %s\n"),
+		       dfile);
+
+		fprintf(stdout, _("File created by PCP version %s\n"),
+			version
+			);
+		return; /* JKU TODO */
+
+		printf(_("Genuine sa datafile: %s (%x)\n"),
+		       _("no"),
+		       0x00);
+
+		printf(_("Host: "));
+		print_gal_header(localtime_r(&t, &rectime),
+				 file_hdr->sa_sysname, file_hdr->sa_release,
+				 file_hdr->sa_nodename, file_hdr->sa_machine,
+				 file_hdr->sa_cpu_nr > 1 ? file_hdr->sa_cpu_nr - 1 : 1,
+				 PLAIN_OUTPUT);
+
+		/* Fill file timestamp structure (rectime) */
+		get_file_timestamp_struct(flags, &rectime, file_hdr);
+		strftime(cur_time, sizeof(cur_time), "%Y-%m-%d", &rectime);
+		printf(_("File date: %s\n"), cur_time);
+
+		if (gmtime_r(&t, &loc_t) != NULL) {
+			printf(_("File time: "));
+			strftime(cur_time, sizeof(cur_time), "%T", &loc_t);
+			printf("%s UTC (%llu)\n", cur_time, file_hdr->sa_ust_time);
+		}
+
+		printf(_("Timezone: %s\n"), file_hdr->sa_tzname);
+
+		/* File composition: file_header, file_activity, record_header */
+		printf(_("File composition: (%u,%u,%u),(%u,%u,%u),(%u,%u,%u)\n"),
+		       file_magic->hdr_types_nr[0], file_magic->hdr_types_nr[1], file_magic->hdr_types_nr[2],
+		       file_hdr->act_types_nr[0], file_hdr->act_types_nr[1], file_hdr->act_types_nr[2],
+		       file_hdr->rec_types_nr[0], file_hdr->rec_types_nr[1], file_hdr->rec_types_nr[2]);
+
+		printf(_("Size of a long int: %d\n"), file_hdr->sa_sizeof_long);
+		printf("HZ = %lu\n", file_hdr->sa_hz);
+		printf(_("Number of activities in file: %u\n"),
+		       file_hdr->sa_act_nr);
+		printf(_("Extra structures available: %c\n"),
+		       file_hdr->extra_next ? 'Y' : 'N');
+
+		printf(_("List of activities:\n"));
+		fal = file_actlst;
+		for (i = 0; i < file_hdr->sa_act_nr; i++, fal++) {
+
+			p = get_activity_position(act, fal->id, RESUME_IF_NOT_FOUND);
+
+			printf("%02u: [%02x] ", fal->id, fal->magic);
+			if (p >= 0) {
+				printf("%-20s", act[p]->name);
+			}
+			else {
+				printf("%-20s", _("Unknown activity"));
+			}
+			printf(" %c:%4d", fal->has_nr ? 'Y' : 'N', fal->nr);
+			if (fal->nr2 > 1) {
+				printf("x%d", fal->nr2);
+			}
+			printf("\t(%u,%u,%u)", fal->types_nr[0], fal->types_nr[1], fal->types_nr[2]);
+			if ((p >= 0) && (act[p]->magic != fal->magic)) {
+				printf(_(" \t[Unknown format]"));
+			}
+			printf("\n");
+		}
+	}
+}
+#endif /* HAVE_PCP */
+
 /*
  ***************************************************************************
  * Display the header of the report (SVG format).
